@@ -18,6 +18,13 @@ from pytensor_ml.layers.norm import (
     LayerNormLayer,
     NoRunningStatsBatchNormLayer,
     PredictionBatchNormLayer,
+    RMSNorm,
+    RMSNormLayer,
+)
+from pytensor_ml.layers.positional import (
+    RotaryEmbedding,
+    RotaryEmbeddingLayer,
+    rotary_embedding,
 )
 from pytensor_ml.layers.transformer import FeedForward, TransformerBlock
 
@@ -33,8 +40,11 @@ __all__ = [
     "LayerNorm",
     "Linear",
     "MultiheadAttention",
+    "RMSNorm",
+    "RotaryEmbedding",
     "Sequential",
     "Squeeze",
     "TransformerBlock",
+    "rotary_embedding",
     "scaled_dot_product_attention",
 ]

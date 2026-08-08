@@ -27,10 +27,12 @@ from pytensor_ml.layers import (
     Embedding,
     LayerNorm,
     Linear,
+    RMSNorm,
     Sequential,
     Squeeze,
 )
 from pytensor_ml.layers.attention import scaled_dot_product_attention
+from pytensor_ml.layers.positional import rotary_embedding
 from pytensor_ml.pytensorf import collect_shared_variables, collect_trainable_params
 from pytensor_ml.serialize.base import _TYPE_FROM_JSON, _TYPE_TO_JSON
 
@@ -116,6 +118,30 @@ def test_batchnorm_variants_roundtrip(kwargs):
 def test_layernorm_roundtrips(affine):
     X, output = initialized_network(Linear("fc", 4, 6), LayerNorm("ln", n_in=6, affine=affine))
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
+
+
+@pytest.mark.parametrize("affine", [True, False], ids=["affine", "no_affine"])
+def test_rmsnorm_roundtrips(affine):
+    X, output = initialized_network(Linear("fc", 4, 6), RMSNorm("rms", n_in=6, affine=affine))
+    assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
+
+
+@pytest.mark.parametrize("pairing", ["half", "adjacent"])
+@pytest.mark.parametrize(
+    "scaling, scaling_factor",
+    [("none", 1.0), ("linear", 4.0), ("ntk", 4.0)],
+    ids=["unscaled", "linear", "ntk"],
+)
+def test_rotary_embedding_roundtrips(pairing, scaling, scaling_factor):
+    # Every option is a prop, so the rebuilt op must reproduce the same frequencies; a dropped prop
+    # would silently fall back to the default and still evaluate.
+    x = pt.tensor("x", shape=(2, 3, 5, 8))
+    positions = pt.lvector("positions")
+    output = rotary_embedding(
+        x, positions, base=500.0, pairing=pairing, scaling=scaling, scaling_factor=scaling_factor
+    )
+    values = [np.random.default_rng(0).normal(size=(2, 3, 5, 8)), np.arange(5)]
+    assert_outputs_roundtrip([x, positions], output, values)
 
 
 def test_squeeze_roundtrips():

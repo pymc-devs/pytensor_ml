@@ -10,7 +10,16 @@ from pytensor.graph.replace import vectorize_graph
 import pytensor_ml.layers
 
 from pytensor_ml.activations import ReLU
-from pytensor_ml.layers import BatchNorm2D, Dropout, Embedding, Input, LayerNorm, Linear, Sequential
+from pytensor_ml.layers import (
+    BatchNorm2D,
+    Dropout,
+    Embedding,
+    Input,
+    LayerNorm,
+    Linear,
+    RMSNorm,
+    Sequential,
+)
 from pytensor_ml.pytensorf import (
     collect_non_trainable_updates,
     collect_trainable_params,
@@ -223,6 +232,72 @@ def test_layer_norm_no_affine_standardizes_each_row(rng):
     np.testing.assert_allclose(res.var(axis=-1), 1.0, rtol=1e-3)
 
 
+@pytest.mark.parametrize("batch_shape", [(10,), (2, 4)], ids=["2d", "3d"])
+@pytest.mark.parametrize("n_in", [6, None], ids=["specified", "lazy"])
+def test_rms_norm_forward(n_in, batch_shape, rng):
+    X = pt.tensor("X", shape=(*(None,) * len(batch_shape), 6))
+    rms_norm = RMSNorm(name="RMSNorm_1", n_in=n_in)
+    out = rms_norm(X)
+    assert out.name == "RMSNorm_1_output"
+
+    X_np = rng.normal(size=(*batch_shape, 6)).astype(floatX)
+    scale_np = rng.normal(size=(6,)).astype(floatX)
+    rms_norm.scale.set_value(scale_np)
+
+    res = out.eval({X: X_np})
+    mean_square_np = np.square(X_np).mean(axis=-1, keepdims=True)
+    expected = X_np / np.sqrt(mean_square_np + rms_norm.epsilon) * scale_np
+    np.testing.assert_allclose(res, expected, rtol=1e-5)
+
+
+def test_rms_norm_has_no_shift_parameter():
+    # Scale-only by definition, matching torch.nn.RMSNorm and flax/tinygrad's RMSNorm. A `loc` here
+    # would mean the layer had quietly become a LayerNorm.
+    rms_norm = RMSNorm(name="RMSNorm_1", n_in=6)
+    assert not hasattr(rms_norm, "loc")
+    assert collect_trainable_params(rms_norm(pt.tensor("X", shape=(None, 6)))) == [rms_norm.scale]
+
+
+def test_rms_norm_no_affine_gives_unit_root_mean_square(rng):
+    X = pt.tensor("X", shape=(None, 8))
+    out = RMSNorm(name="RMSNorm_1", n_in=8, affine=False)(X)
+
+    X_np = rng.normal(loc=3.0, scale=2.0, size=(10, 8)).astype(floatX)
+    res = out.eval({X: X_np})
+
+    np.testing.assert_allclose(np.sqrt(np.square(res).mean(axis=-1)), 1.0, rtol=1e-3)
+
+
+def test_rms_norm_does_not_center_its_input(rng):
+    # The one thing that separates RMSNorm from LayerNorm: the mean survives. On input with a large
+    # offset, LayerNorm removes it and RMSNorm does not, so the two must disagree.
+    X = pt.tensor("X", shape=(None, 8))
+    X_np = rng.normal(loc=5.0, scale=1.0, size=(10, 8)).astype(floatX)
+
+    rms = RMSNorm(name="rms", n_in=8, affine=False)(X).eval({X: X_np})
+    layer = LayerNorm(name="ln", n_in=8, affine=False)(X).eval({X: X_np})
+
+    # LayerNorm removes the offset outright; RMSNorm only rescales it, so a clearly non-zero mean
+    # survives. A stray mean subtraction in RMSNorm would drive this to zero.
+    np.testing.assert_allclose(layer.mean(axis=-1), 0.0, atol=1e-5)
+    assert np.all(rms.mean(axis=-1) > 0.5)
+    assert not np.allclose(rms, layer)
+
+
+def test_rms_norm_prediction_matches_training(rng):
+    # Per-sample statistics, identical in train and eval, so like LayerNorm it needs no prediction
+    # rewrite: rewrite_for_prediction must leave its output unchanged.
+    X = pt.tensor("X", shape=(None, 6))
+    rms_norm = RMSNorm("rms", n_in=6)
+    out = rms_norm(X)
+    rms_norm.scale.set_value(rng.normal(size=6).astype(floatX))
+
+    X_np = rng.normal(size=(10, 6)).astype(floatX)
+    np.testing.assert_allclose(
+        rewrite_for_prediction(out).eval({X: X_np}), out.eval({X: X_np}), rtol=1e-6
+    )
+
+
 def test_batch_norm_2d_learns_population_stats(rng):
     population_mean, population_std = 3.2, 6.2
     X = pt.tensor("X", shape=(None, 32))
@@ -288,6 +363,8 @@ def test_batch_norm_2d_learns_population_stats(rng):
         ("NoRunningStatsBatchNormLayer", "norm"),
         ("PredictionBatchNormLayer", "norm"),
         ("LayerNormLayer", "norm"),
+        ("RMSNormLayer", "norm"),
+        ("RotaryEmbeddingLayer", "positional"),
     ],
 )
 def test_marker_ops_stay_reachable_from_the_package(op_name, submodule):

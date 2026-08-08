@@ -335,3 +335,99 @@ class LayerNorm(Layer):
         X_transformed.name = f"{self.name}_output"
 
         return X_transformed
+
+
+class RMSNormLayer(UnaryLayerOp):
+    __props__ = ("n_in", "epsilon", "affine")
+
+    def build_inner_graph(self, X, *rest):
+        epsilon = pt.constant(self.epsilon, dtype=X.type.dtype)
+        mean_square = pt.mean(pt.square(X), axis=-1, keepdims=True)
+        X_normalized = X / pt.sqrt(mean_square + epsilon)
+        if not self.affine:
+            return [X_normalized]
+
+        (scale,) = rest
+        return [X_normalized * scale]
+
+
+class RMSNorm(Layer):
+    r"""
+    Root-mean-square layer normalization over the last (feature) axis.
+
+    Divide each sample by the root mean square of its own features, then optionally apply a learned
+    scale:
+
+    .. math::
+
+        y = \frac{x}{\sqrt{\frac{1}{n} \sum_i x_i^2 + \epsilon}} \cdot \gamma.
+
+    Unlike :class:`LayerNorm` there is no mean subtraction and no learned shift; the scale is the only
+    parameter. This is the normalization used by the Llama, Gemma and Qwen decoder families.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name used as a prefix for the layer's parameters. Default is "RMSNorm".
+    n_in : int, optional
+        Size of the normalized feature axis. Inferred from the input's last dimension on the first
+        call when omitted.
+    epsilon : float, optional
+        Constant :math:`\epsilon` added to the mean square for numerical stability. Default is 1e-6.
+    affine : bool, optional
+        Apply the learned scale :math:`\gamma`. Default is True.
+
+    References
+    ----------
+    .. [1] Zhang, B., & Sennrich, R. (2019). Root Mean Square Layer Normalization.
+           arXiv:1910.07467. https://arxiv.org/abs/1910.07467.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        n_in: int | None = None,
+        epsilon: float = 1e-6,
+        affine: bool = True,
+    ):
+        self.name = name if name else "RMSNorm"
+        self.n_in = n_in
+        self.epsilon = epsilon
+        self.affine = affine
+
+        self.scale: TrainableParameter | None = None
+
+        self.initialized = False
+        self._initialize_params(None)
+
+    def _initialize_params(self, X: pt.TensorVariable | None):
+        if self.initialized:
+            return
+
+        n_in = _resolve_n_in(self.name, self.n_in, X)
+        if n_in is None:
+            return
+
+        if self.affine:
+            self.scale = trainable(np.ones(n_in, dtype=config.floatX), f"{self.name}_scale")
+
+        self.initialized = True
+
+    def __call__(self, X: pt.TensorLike) -> pt.TensorVariable:
+        X = pt.as_tensor(X)
+        self._initialize_params(X)
+
+        inputs = [X]
+        if self.affine:
+            assert self.scale is not None
+            inputs.append(self.scale)
+
+        X_transformed = RMSNormLayer(
+            name=self.name,
+            n_in=self.n_in,
+            epsilon=self.epsilon,
+            affine=self.affine,
+        )(*inputs)
+        X_transformed.name = f"{self.name}_output"
+
+        return X_transformed

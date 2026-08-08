@@ -15,6 +15,17 @@ class Layer(ABC):
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable: ...
 
 
+class PositionalLayer(ABC):
+    """Base class for layers that consume token positions alongside their input.
+
+    A sibling of :class:`Layer` rather than a subclass: narrowing ``Layer.__call__`` from one tensor to
+    two is not a valid override, so a subclass would need a type-checker escape at every level.
+    """
+
+    @abstractmethod
+    def __call__(self, x: pt.TensorLike, position_ids: pt.TensorLike) -> pt.TensorVariable: ...
+
+
 class LayerOp(SymbolicOp):
     """Base class for the library's neural-network ops.
 
@@ -53,4 +64,4 @@ class StatefulOp(Protocol):
         """Map each output index to the index of the input that output updates."""
 
 
-__all__ = ["Layer", "LayerOp", "StatefulOp", "UnaryLayerOp"]
+__all__ = ["Layer", "LayerOp", "PositionalLayer", "StatefulOp", "UnaryLayerOp"]
