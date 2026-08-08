@@ -1,8 +1,6 @@
 from collections.abc import Callable, Sequence
 
-from pytensor.tensor import TensorVariable
-
-from pytensor_ml.optim.base import Parameter, Transform, Updates, counter, state_for
+from pytensor_ml.optim.base import Parameter, Schedule, Transform, Updates, counter, state_for
 
 
 def trace(decay: float = 0.9, nesterov: bool = False) -> Transform:
@@ -67,9 +65,7 @@ def scale(factor: float) -> Transform:
     return transform
 
 
-def scale_by_schedule(
-    schedule_fn: Callable[[TensorVariable], TensorVariable],
-) -> Transform:
+def scale_by_schedule(schedule_fn: Schedule) -> Transform:
     """
     Scale each step by a learning rate produced from an owned step counter.
 

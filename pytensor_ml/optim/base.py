@@ -26,6 +26,9 @@ Transform = Callable[[Updates, Sequence[Parameter]], Updates]
 
 UpdateRule = Callable[[LossOrGradients, Sequence[Parameter]], Updates]
 
+# A learning-rate schedule: symbolic step count in, scalar learning rate out.
+type Schedule = Callable[[TensorVariable], TensorVariable]
+
 
 def get_gradients(
     loss_or_gradients: LossOrGradients,
