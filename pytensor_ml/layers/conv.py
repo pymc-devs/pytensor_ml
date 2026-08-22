@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from functools import reduce
-from operator import mul
+from operator import add, mul
 
 import numpy as np
 import pytensor.tensor as pt
@@ -381,12 +381,13 @@ class ConvLayerGrad(LayerOp):
     ----------
     kernel_size, stride, dilation : tuple of int
         The forward convolution being differentiated.
-    compute_dX : bool
-        Return the input gradient alongside the kernel's. False drops it, which is right only where
-        nothing consumes it -- the first convolution of a network, whose input is data.
+    compute_dX, compute_dW : bool, optional
+        Which gradients to return, in that order. Dropping one is right wherever nothing consumes it:
+        the first convolution of a network needs no input gradient, and a transposed convolution needs
+        no kernel gradient. At least one must be asked for. Both default to ``True``.
     """
 
-    __props__ = ("kernel_size", "stride", "dilation", "compute_dX")
+    __props__ = ("kernel_size", "stride", "dilation", "compute_dX", "compute_dW")
 
     def __init__(
         self,
@@ -394,19 +395,74 @@ class ConvLayerGrad(LayerOp):
         stride: tuple[int, ...],
         dilation: tuple[int, ...],
         compute_dX: bool = True,
+        compute_dW: bool = True,
         **kwargs,
     ):
+        if not (compute_dX or compute_dW):
+            raise ValueError(
+                "ConvLayerGrad must return at least one gradient, but both compute_dX and compute_dW "
+                "are False."
+            )
         self.kernel_size = kernel_size
         self.stride = stride
         self.dilation = dilation
         self.compute_dX = compute_dX
+        self.compute_dW = compute_dW
         super().__init__(**kwargs)
 
     def build_inner_graph(self, X, W, cotangent):
         """Differentiate the forward correlation, which is what every dispatch also does."""
         out = _correlate(X, W, self.kernel_size, self.stride, self.dilation)
-        wrt = [X, W] if self.compute_dX else [W]
+        wrt = [
+            variable for variable, wanted in ((X, self.compute_dX), (W, self.compute_dW)) if wanted
+        ]
         return list(pt.grad(cost=None, wrt=wrt, known_grads={out: cotangent}))
+
+    def pullback(self, inputs, outputs, cotangents):
+        r"""
+        Differentiate through convolutions rather than through the inner graph.
+
+        The default would inline an anonymous ``OpFromGraph`` around the gather, which no backend can
+        dispatch against and which only numba can run at all. Each output is linear in two of the three
+        inputs and the adjoint of a correlation is the other output, so writing :math:`C` for the
+        forward correlation, :math:`T` for the input gradient and :math:`K` for the kernel gradient,
+
+        .. math::
+
+            \langle T(V, W), G \rangle = \langle V, C(G, W) \rangle = \langle W, K(G, V) \rangle
+
+            \langle K(X, V), H \rangle = \langle V, C(X, H) \rangle = \langle X, T(V, H) \rangle
+
+        Each gradient is therefore a :class:`ConvLayer` or a one-sided :class:`ConvLayerGrad`. The input
+        gradient does not read ``X`` and the kernel gradient does not read ``W``, so each is
+        disconnected from the input the other consumes when its own output is not computed.
+        """
+        X, W, cotangent = inputs
+        geometry = (self.kernel_size, self.stride, self.dilation)
+        # One cotangent arrives per output, in output order, so the flags that chose the outputs
+        # also say which cotangent belongs to which gradient.
+        arriving = iter(cotangents)
+        dX_bar = next(arriving) if self.compute_dX else None
+        dW_bar = next(arriving) if self.compute_dW else None
+
+        # The cotangent is the one input both outputs read, so its gradient collects a term from each.
+        cotangent_terms = []
+        if dX_bar is not None:
+            cotangent_terms.append(ConvLayer(*geometry)(dX_bar, W))
+        if dW_bar is not None:
+            cotangent_terms.append(ConvLayer(*geometry)(X, dW_bar))
+
+        dX = (
+            disconnected_type()
+            if dW_bar is None
+            else ConvLayerGrad(*geometry, compute_dW=False)(X, dW_bar, cotangent)
+        )
+        dW = (
+            disconnected_type()
+            if dX_bar is None
+            else ConvLayerGrad(*geometry, compute_dX=False)(dX_bar, W, cotangent)
+        )
+        return [dX, dW, reduce(add, cotangent_terms)]
 
 
 def _correlate(

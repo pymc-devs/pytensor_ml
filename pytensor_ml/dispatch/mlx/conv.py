@@ -43,15 +43,20 @@ def mlx_funcify_ConvLayerGrad(op, node=None, **kwargs):
     nothing beyond the intermediates the gradients need anyway.
     """
     convolve = _convolution(op)
-    compute_dX = op.compute_dX
+    compute_dX, compute_dW = op.compute_dX, op.compute_dW
 
     def conv_grad(X, W, cotangent):
-        # An op with one output is dispatched to a function returning that output, not a list of one.
-        if compute_dX:
+        # The vjp is taken only over the inputs whose gradient is wanted; the rest are closed over as
+        # constants, so mlx never differentiates toward a gradient the graph will not read.
+        if compute_dX and compute_dW:
             _, pullback = mx.vjp(convolve, [X, W], [cotangent])
             return tuple(pullback)
-        _, pullback = mx.vjp(lambda w: convolve(X, w), [W], [cotangent])
-        (kernel_gradient,) = pullback
-        return kernel_gradient
+        # An op with one output is dispatched to a function returning that output, not a list of one.
+        if compute_dX:
+            _, pullback = mx.vjp(lambda x: convolve(x, W), [X], [cotangent])
+        else:
+            _, pullback = mx.vjp(lambda w: convolve(X, w), [W], [cotangent])
+        (gradient,) = pullback
+        return gradient
 
     return conv_grad

@@ -53,15 +53,20 @@ def jax_funcify_ConvLayer(op, node=None, **kwargs):
 def jax_funcify_ConvLayerGrad(op, node=None, **kwargs):
     """Let jax differentiate its own convolution rather than spelling the two gradients out."""
     convolve = _convolution(op)
-    compute_dX = op.compute_dX
+    compute_dX, compute_dW = op.compute_dX, op.compute_dW
 
     def conv_grad(X, W, cotangent):
-        # An op with one output is dispatched to a function returning that output, not a list of one.
-        if compute_dX:
+        # The vjp is taken only over the inputs whose gradient is wanted; the rest are closed over as
+        # constants, so jax never differentiates toward a gradient the graph will not read.
+        if compute_dX and compute_dW:
             _, pullback = jax.vjp(convolve, X, W)
             return tuple(pullback(cotangent))
-        _, pullback = jax.vjp(lambda w: convolve(X, w), W)
-        (kernel_gradient,) = pullback(cotangent)
-        return kernel_gradient
+        # An op with one output is dispatched to a function returning that output, not a list of one.
+        if compute_dX:
+            _, pullback = jax.vjp(lambda x: convolve(x, W), X)
+        else:
+            _, pullback = jax.vjp(lambda w: convolve(X, w), W)
+        (gradient,) = pullback(cotangent)
+        return gradient
 
     return conv_grad

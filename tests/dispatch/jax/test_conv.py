@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("jax")
 
 from pytensor_ml.layers import Conv1D
-from pytensor_ml.layers.conv import ConvLayer
+from pytensor_ml.layers.conv import ConvLayer, ConvLayerGrad
 from tests.dispatch.jax.test_basic import compare_jax_and_py
 
 floatX = pytensor.config.floatX
@@ -108,21 +108,26 @@ def test_the_gradient_dispatch_matches_the_graph(spatial, rng):
         )
 
 
-def test_the_input_gradient_is_dropped_when_nothing_reads_it(rng):
-    """`ConvLayer.pullback` always asks for both gradients; the rewrite lowers `compute_dX` where the
-    input gradient has no clients, so the backend is asked for one gradient rather than two."""
+@pytest.mark.parametrize("wrt", ["W", "X"], ids=["kernel_only", "input_only"])
+def test_a_lone_gradient_dispatches_and_matches_the_graph(wrt, rng):
+    """`ConvLayer.pullback` asks for both gradients; the rewrite drops whichever has no clients. That
+    reaches a different branch of the dispatch than the pair does -- one that differentiates toward a
+    single input and returns a bare array rather than a tuple -- so it is checked for itself."""
     X = pt.tensor("X", shape=(4, 24, 3), dtype=floatX)
     layer = Conv1D("conv", in_channels=3, out_channels=5, kernel_size=3)
-    cost = layer(X).sum()
+    layer.W.set_value(rng.normal(size=(3, 3, 5)).astype(floatX))
+    layer.b.set_value(rng.normal(size=(5,)).astype(floatX))
+    cost = (layer(X) ** 2).sum()
+    X_np = rng.normal(size=(4, 24, 3)).astype(floatX)
 
-    def grad_op(targets):
-        fn = pytensor.function([X], targets, mode="JAX")
-        return next(
-            n.op for n in fn.maker.fgraph.apply_nodes if type(n.op).__name__ == "ConvLayerGrad"
-        )
+    gradient = pt.grad(cost, X if wrt == "X" else layer.W)
+    fn = pytensor.function([X], gradient, mode="JAX")
+    grad_op = next(
+        n.op for n in fn.maker.fgraph.apply_nodes if type(n.op).__name__ == "ConvLayerGrad"
+    )
 
-    assert grad_op([pt.grad(cost, layer.W)]).compute_dX is False
-    assert grad_op(pt.grad(cost, [layer.W, X])).compute_dX is True
+    assert (grad_op.compute_dX, grad_op.compute_dW) == (wrt == "X", wrt == "W")
+    assert_close(np.asarray(fn(X_np)), np.asarray(pytensor.function([X], gradient)(X_np)))
 
 
 def test_the_conv_op_matches_the_graph_over_two_spatial_axes(rng):
@@ -136,3 +141,28 @@ def test_the_conv_op_matches_the_graph_over_two_spatial_axes(rng):
 
     out = ConvLayer((2, 3), (2, 1), (1, 2))(X, W)
     compare_jax_and_py([X, W], out, [X_np, W_np], assert_fn=assert_close)
+
+
+@pytest.mark.parametrize("stride", [1, 2], ids=["plain", "strided"])
+def test_a_transposed_convolutions_gradient_matches_the_graph(stride, rng):
+    """A transposed convolution is `ConvLayerGrad` run forward, so its own gradient is what a decoder
+    trains on. The pullback has to reach ops this backend dispatches -- the inherited `OpFromGraph` one
+    reaches the patch gather, which has no jax kernel and so fails to convert at all. Stride rides
+    on the op's props, so the dispatch has to read it back rather than assume it."""
+    X_shape = (2, 7, 7, 3)
+    W_np = rng.normal(size=(3, 3, 3, 4)).astype(floatX)
+    geometry = ((3, 3), (stride, stride), (1, 1))
+    cotangent_shape = ConvLayer(*geometry)(
+        pt.zeros(X_shape, dtype=floatX), pt.tensor(shape=W_np.shape)
+    ).type.shape
+    cotangent_np = rng.normal(size=cotangent_shape).astype(floatX)
+
+    W = pt.tensor("W", shape=W_np.shape, dtype=floatX)
+    cotangent = pt.tensor("cotangent", shape=cotangent_shape, dtype=floatX)
+    out = ConvLayerGrad(*geometry, compute_dW=False)(pt.zeros(X_shape, dtype=floatX), W, cotangent)
+    gradients = pt.grad((out**2).sum(), [W, cotangent])
+
+    dispatched = pytensor.function([W, cotangent], gradients, mode="JAX")(W_np, cotangent_np)
+    reference = pytensor.function([W, cotangent], gradients)(W_np, cotangent_np)
+    for got, expected in zip(dispatched, reference):
+        assert_close(np.asarray(got), np.asarray(expected))

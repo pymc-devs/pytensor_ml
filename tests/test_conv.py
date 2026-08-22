@@ -3,6 +3,9 @@ import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from pytensor.compile.builders import OpFromGraph
+from pytensor.compile.mode import get_default_mode
+from pytensor.gradient import verify_grad
 from scipy.signal import correlate
 
 from pytensor_ml.activations import ReLU
@@ -496,30 +499,6 @@ def test_im2col_infers_the_shape_it_produces(rng):
     np.testing.assert_array_equal(inferred, pytensor.function([X], patches)(X_np).shape)
 
 
-def test_the_input_gradient_is_dropped_when_nothing_reads_it(rng):
-    """`ConvLayer.pullback` always asks for both gradients, because only the graph knows which are
-    wanted. The rewrite lowers `compute_dX` where the input gradient has no clients -- the first
-    convolution of a network -- so the backward computes one gradient rather than two."""
-    X = pt.tensor("X", shape=(4, 24, 3))
-    layer = Conv1D("conv", in_channels=3, out_channels=5, kernel_size=3)
-    cost = layer(X).sum()
-
-    def grad_op(targets):
-        fn = pytensor.function([X], targets)
-        return next(
-            node.op for node in fn.maker.fgraph.apply_nodes if isinstance(node.op, ConvLayerGrad)
-        )
-
-    assert grad_op([pt.grad(cost, layer.W)]).compute_dX is False
-    assert grad_op(pt.grad(cost, [layer.W, X])).compute_dX is True
-
-    # Dropping the output must not change the one that is kept.
-    X_np = rng.normal(size=(4, 24, 3)).astype(floatX)
-    alone = pytensor.function([X], pt.grad(cost, layer.W))(X_np)
-    alongside = pytensor.function([X], pt.grad(cost, [layer.W, X]))(X_np)[0]
-    np.testing.assert_allclose(alone, alongside, atol=ATOL)
-
-
 @pytest.mark.parametrize(
     "spatial, kernel_size, stride, dilation",
     [
@@ -779,3 +758,122 @@ def test_a_convolutional_network_trains_end_to_end(rng):
 
     losses = [float(step(X_np, y_np)) for _ in range(50)]
     assert losses[-1] < losses[0] / 5
+
+
+@pytest.mark.parametrize(
+    "wanted, expected",
+    [("dX", (True, False)), ("dW", (False, True)), ("both", (True, True))],
+    ids=["input_only", "kernel_only", "both"],
+)
+def test_the_pullback_computes_only_the_gradients_something_reads(wanted, expected, rng):
+    """`ConvLayer.pullback` asks for both gradients because only the graph knows which are wanted, and
+    only once it is built. A rewrite then drops whichever has no clients -- the input gradient for the
+    first convolution of a network, the kernel gradient for a transposed one -- and the numbers it
+    leaves behind have to be the ones the un-rewritten graph would have produced."""
+    X = pt.tensor("X", shape=(4, 24, 3))
+    layer = Conv1D("conv", in_channels=3, out_channels=5, kernel_size=3)
+    layer.W.set_value(rng.normal(size=(3, 3, 5)).astype(floatX))
+    layer.b.set_value(rng.normal(size=(5,)).astype(floatX))
+    cost = (layer(X) ** 2).sum()
+    targets = {
+        "dX": [pt.grad(cost, X)],
+        "dW": [pt.grad(cost, layer.W)],
+        "both": pt.grad(cost, [X, layer.W]),
+    }[wanted]
+    X_np = rng.normal(size=(4, 24, 3)).astype(floatX)
+
+    fn = pytensor.function([X], targets)
+    grad_op = next(
+        node.op for node in fn.maker.fgraph.apply_nodes if isinstance(node.op, ConvLayerGrad)
+    )
+    assert (grad_op.compute_dX, grad_op.compute_dW) == expected
+
+    unrewritten = get_default_mode().excluding("drop_unused_input_grad", "drop_unused_kernel_grad")
+    for dropped, kept in zip(pytensor.function([X], targets, mode=unrewritten)(X_np), fn(X_np)):
+        np.testing.assert_allclose(kept, dropped, atol=ATOL)
+
+
+@pytest.mark.parametrize("dropped", ["dX", "dW"], ids=["without_dX", "without_dW"])
+def test_dropping_one_gradient_leaves_the_other_unchanged(dropped, rng):
+    """The rewrite is only safe if a lowered op returns the same numbers as the pair it replaces, so
+    this compares them directly rather than trusting that fewer outputs means the same arithmetic."""
+    X_np = rng.normal(size=(2, 6, 6, 3)).astype(floatX)
+    W_np = rng.normal(size=(3, 3, 3, 4)).astype(floatX)
+    V_np = rng.normal(size=(2, 4, 4, 4)).astype(floatX)
+    X = pt.tensor("X", shape=X_np.shape)
+    W = pt.tensor("W", shape=W_np.shape)
+    cotangent = pt.tensor("cotangent", shape=V_np.shape)
+
+    geometry = ((3, 3), (1, 1), (1, 1))
+    keeping_dX = dropped == "dW"
+    both = ConvLayerGrad(*geometry)(X, W, cotangent)
+    alone = ConvLayerGrad(*geometry, compute_dX=keeping_dX, compute_dW=not keeping_dX)(
+        X, W, cotangent
+    )
+
+    kept = both[0] if keeping_dX else both[1]
+    values = pytensor.function([X, W, cotangent], [kept, alone])(X_np, W_np, V_np)
+    np.testing.assert_allclose(*values, atol=ATOL)
+
+
+def test_the_pullback_must_return_some_gradient():
+    """Both flags false describes an op with no outputs, which would build and then fail somewhere
+    downstream rather than where the mistake was made."""
+    with pytest.raises(ValueError, match="must return at least one gradient"):
+        ConvLayerGrad((3,), (1,), (1,), compute_dX=False, compute_dW=False)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{"compute_dW": False}, {"compute_dX": False}, {}],
+    ids=["dX_only", "dW_only", "both"],
+)
+def test_differentiating_a_conv_gradient_leaves_only_dispatchable_ops(flags):
+    """A transposed convolution is `ConvLayerGrad` run forward, so training one differentiates through
+    it. Inheriting `OpFromGraph`'s pullback would wrap the gather in an anonymous op carrying no props
+    and registered against no type, which every backend but numba refuses outright. Each combination of
+    flags builds a different set of terms, so each is checked."""
+    geometry = ((3, 3), (1, 1), (1, 1))
+    X = pt.tensor("X", shape=(2, 6, 6, 3))
+    W = pt.tensor("W", shape=(3, 3, 3, 4))
+    cotangent = pt.tensor("cotangent", shape=(2, 4, 4, 4))
+
+    outputs = ConvLayerGrad(*geometry, **flags)(X, W, cotangent, return_list=True)
+    cost = sum((out**2).sum() for out in outputs)
+    gradients = pt.grad(cost, [X, W, cotangent], disconnected_inputs="ignore")
+    fn = pytensor.function([X, W, cotangent], gradients)
+
+    convolutions = {ConvLayer, ConvLayerGrad}
+    leftover = [
+        node.op
+        for node in fn.maker.fgraph.apply_nodes
+        if isinstance(node.op, OpFromGraph) and type(node.op) not in convolutions
+    ]
+    assert not leftover, f"undispatchable ops survived the pullback: {leftover}"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{"compute_dW": False}, {"compute_dX": False}, {}],
+    ids=["dX_only", "dW_only", "both"],
+)
+@pytest.mark.parametrize(
+    "stride, dilation", [(1, 1), (2, 1), (1, 2)], ids=["plain", "strided", "dilated"]
+)
+def test_the_pullback_of_the_pullback_matches_finite_differences(flags, stride, dilation, rng):
+    """The closed forms the pullback uses are adjoint identities rather than a differentiated graph,
+    so they are checked numerically. Every input is perturbed, including the one each output
+    ignores."""
+    geometry = ((3, 3), (stride, stride), (dilation, dilation))
+    X_np = rng.normal(size=(2, 7, 7, 3)).astype(floatX)
+    W_np = rng.normal(size=(3, 3, 3, 4)).astype(floatX)
+    cotangent_shape = ConvLayer(*geometry)(
+        pt.zeros(X_np.shape, dtype=floatX), pt.tensor(shape=W_np.shape)
+    ).type.shape
+    cotangent_np = rng.normal(size=cotangent_shape).astype(floatX)
+    op = ConvLayerGrad(*geometry, **flags)
+
+    def summed_outputs(X, W, cotangent):
+        return sum((out**2).sum() for out in op(X, W, cotangent, return_list=True))
+
+    verify_grad(summed_outputs, [X_np, W_np, cotangent_np], rng=np.random.default_rng(0))

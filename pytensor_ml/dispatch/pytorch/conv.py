@@ -50,14 +50,18 @@ def pytorch_funcify_ConvLayer(op, node=None, **kwargs):
 def pytorch_funcify_ConvLayerGrad(op, node=None, **kwargs):
     """Let torch differentiate its own convolution rather than spelling the two gradients out."""
     convolve = _convolution(op)
-    compute_dX = op.compute_dX
+    compute_dX, compute_dW = op.compute_dX, op.compute_dW
 
     def conv_grad(X, W, cotangent):
+        # Only the inputs whose gradient is wanted require one, so torch never differentiates toward a
+        # gradient the graph will not read.
+        X_leaf = X.detach().requires_grad_(compute_dX)
+        W_leaf = W.detach().requires_grad_(compute_dW)
+        wrt = tuple(
+            tensor for tensor, wanted in ((X_leaf, compute_dX), (W_leaf, compute_dW)) if wanted
+        )
+        gradients = torch.autograd.grad(convolve(X_leaf, W_leaf), wrt, grad_outputs=cotangent)
         # An op with one output is dispatched to a function returning that output, not a list of one.
-        X = X.detach().requires_grad_(compute_dX)
-        W = W.detach().requires_grad_(True)
-        wrt = (X, W) if compute_dX else (W,)
-        gradients = torch.autograd.grad(convolve(X, W), wrt, grad_outputs=cotangent)
-        return gradients if compute_dX else gradients[0]
+        return gradients if len(gradients) > 1 else gradients[0]
 
     return conv_grad
